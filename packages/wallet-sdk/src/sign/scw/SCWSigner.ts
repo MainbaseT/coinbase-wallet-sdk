@@ -1,43 +1,58 @@
-import { StateUpdateListener } from '../interface';
-import { SCWKeyManager } from './SCWKeyManager';
-import { SCWStateManager } from './SCWStateManager';
-import { standardErrors } from ':core/error';
-import { RPCRequestMessage, RPCResponse, RPCResponseMessage } from ':core/message';
-import { AppMetadata, RequestArguments, Signer } from ':core/provider/interface';
-import { Method } from ':core/provider/method';
-import { AddressString } from ':core/type';
-import { ensureIntNumber } from ':core/type/util';
+import { Signer } from '../interface.js';
+import { SCWKeyManager } from './SCWKeyManager.js';
+import { Communicator } from ':core/communicator/Communicator.js';
+import { standardErrors } from ':core/error/errors.js';
+import { RPCRequestMessage, RPCResponseMessage } from ':core/message/RPCMessage.js';
+import { RPCResponse } from ':core/message/RPCResponse.js';
+import { AppMetadata, ProviderEventCallback, RequestArguments } from ':core/provider/interface.js';
+import { ScopedLocalStorage } from ':core/storage/ScopedLocalStorage.js';
+import { AddressString } from ':core/type/index.js';
+import { ensureIntNumber, hexStringFromNumber } from ':core/type/util.js';
 import {
   decryptContent,
   encryptContent,
   exportKeyToHexString,
   importKeyFromHexString,
-} from ':util/cipher';
+} from ':util/cipher.js';
+import { fetchRPCRequest } from ':util/provider.js';
 
-type SwitchEthereumChainParam = [
-  {
-    chainId: `0x${string}`; // Hex chain id
-  },
-];
+const ACCOUNTS_KEY = 'accounts';
+const ACTIVE_CHAIN_STORAGE_KEY = 'activeChain';
+const AVAILABLE_CHAINS_STORAGE_KEY = 'availableChains';
+const WALLET_CAPABILITIES_STORAGE_KEY = 'walletCapabilities';
+
+type Chain = {
+  id: number;
+  rpcUrl?: string;
+};
+
+type ConstructorOptions = {
+  metadata: AppMetadata;
+  communicator: Communicator;
+  callback: ProviderEventCallback | null;
+};
 
 export class SCWSigner implements Signer {
   private readonly metadata: AppMetadata;
-  private readonly postMessageToPopup: (_: RPCRequestMessage) => Promise<RPCResponseMessage>;
+  private readonly communicator: Communicator;
   private readonly keyManager: SCWKeyManager;
-  private readonly stateManager: SCWStateManager;
+  private readonly storage: ScopedLocalStorage;
+  private callback: ProviderEventCallback | null;
 
-  constructor(params: {
-    metadata: AppMetadata;
-    postMessageToPopup: (_: RPCRequestMessage) => Promise<RPCResponseMessage>;
-    updateListener: StateUpdateListener;
-  }) {
+  private accounts: AddressString[];
+  private chain: Chain;
+
+  constructor(params: ConstructorOptions) {
     this.metadata = params.metadata;
-    this.postMessageToPopup = params.postMessageToPopup;
+    this.communicator = params.communicator;
+    this.callback = params.callback;
     this.keyManager = new SCWKeyManager();
-    this.stateManager = new SCWStateManager({
-      appChainIds: this.metadata.appChainIds,
-      updateListener: params.updateListener,
-    });
+    this.storage = new ScopedLocalStorage('CBWSDK', 'SCWStateManager');
+
+    this.accounts = this.storage.loadObject(ACCOUNTS_KEY) ?? [];
+    this.chain = this.storage.loadObject(ACTIVE_CHAIN_STORAGE_KEY) || {
+      id: params.metadata.appChainIds?.[0] ?? 1,
+    };
 
     this.handshake = this.handshake.bind(this);
     this.request = this.request.bind(this);
@@ -45,39 +60,97 @@ export class SCWSigner implements Signer {
     this.decryptResponseMessage = this.decryptResponseMessage.bind(this);
   }
 
-  async handshake(): Promise<AddressString[]> {
+  async handshake(args: RequestArguments) {
+    // Open the popup before constructing the request message.
+    // This is to ensure that the popup is not blocked by some browsers (i.e. Safari)
+    await this.communicator.waitForPopupLoaded?.();
+
     const handshakeMessage = await this.createRequestMessage({
       handshake: {
-        method: 'eth_requestAccounts',
-        params: this.metadata,
+        method: args.method,
+        params: Object.assign({}, this.metadata, args.params ?? {}),
       },
     });
-    const response: RPCResponseMessage = await this.postMessageToPopup(handshakeMessage);
+    const response: RPCResponseMessage =
+      await this.communicator.postRequestAndWaitForResponse(handshakeMessage);
 
     // store peer's public key
     if ('failure' in response.content) throw response.content.failure;
     const peerPublicKey = await importKeyFromHexString('public', response.sender);
     await this.keyManager.setPeerPublicKey(peerPublicKey);
 
-    const decrypted = await this.decryptResponseMessage<AddressString[]>(response);
-    this.updateInternalState({ method: 'eth_requestAccounts' }, decrypted);
+    const decrypted = await this.decryptResponseMessage(response);
 
     const result = decrypted.result;
     if ('error' in result) throw result.error;
 
-    return this.stateManager.accounts;
+    switch (args.method) {
+      case 'eth_requestAccounts': {
+        const accounts = result.value as AddressString[];
+        this.accounts = accounts;
+        this.storage.storeObject(ACCOUNTS_KEY, accounts);
+        this.callback?.('accountsChanged', accounts);
+        break;
+      }
+    }
   }
 
-  async request<T>(request: RequestArguments): Promise<T> {
-    const localResult = this.tryLocalHandling<T>(request);
-    if (localResult !== undefined) {
-      if (localResult instanceof Error) throw localResult;
-      return localResult;
+  async request(request: RequestArguments) {
+    if (this.accounts.length === 0) {
+      switch (request.method) {
+        case 'wallet_sendCalls':
+        case 'wallet_sign':
+          return this.sendRequestToPopup(request);
+        default:
+          throw standardErrors.provider.unauthorized();
+      }
     }
 
+    switch (request.method) {
+      case 'eth_requestAccounts':
+        this.callback?.('connect', { chainId: hexStringFromNumber(this.chain.id) });
+        return this.accounts;
+      case 'eth_accounts':
+        return this.accounts;
+      case 'eth_coinbase':
+        return this.accounts[0];
+      case 'net_version':
+        return this.chain.id;
+      case 'eth_chainId':
+        return hexStringFromNumber(this.chain.id);
+      case 'wallet_getCapabilities':
+        return this.storage.loadObject(WALLET_CAPABILITIES_STORAGE_KEY);
+      case 'wallet_switchEthereumChain':
+        return this.handleSwitchChainRequest(request);
+      case 'eth_ecRecover':
+      case 'personal_sign':
+      case 'wallet_sign':
+      case 'personal_ecRecover':
+      case 'eth_signTransaction':
+      case 'eth_sendTransaction':
+      case 'eth_signTypedData_v1':
+      case 'eth_signTypedData_v3':
+      case 'eth_signTypedData_v4':
+      case 'eth_signTypedData':
+      case 'wallet_addEthereumChain':
+      case 'wallet_watchAsset':
+      case 'wallet_sendCalls':
+      case 'wallet_showCallsStatus':
+      case 'wallet_grantPermissions':
+        return this.sendRequestToPopup(request);
+      default:
+        if (!this.chain.rpcUrl) throw standardErrors.rpc.internal('No RPC URL set for chain');
+        return fetchRPCRequest(request, this.chain.rpcUrl);
+    }
+  }
+
+  private async sendRequestToPopup(request: RequestArguments) {
+    // Open the popup before constructing the request message.
+    // This is to ensure that the popup is not blocked by some browsers (i.e. Safari)
+    await this.communicator.waitForPopupLoaded?.();
+
     const response = await this.sendEncryptedRequest(request);
-    const decrypted = await this.decryptResponseMessage<T>(response);
-    this.updateInternalState(request, decrypted);
+    const decrypted = await this.decryptResponseMessage(response);
 
     const result = decrypted.result;
     if ('error' in result) throw result.error;
@@ -85,37 +158,38 @@ export class SCWSigner implements Signer {
     return result.value;
   }
 
-  async disconnect() {
-    this.stateManager.clear();
+  async cleanup() {
+    this.storage.clear();
     await this.keyManager.clear();
+    this.accounts = [];
+    this.chain = {
+      id: this.metadata.appChainIds?.[0] ?? 1,
+    };
   }
 
-  private tryLocalHandling<T>(request: RequestArguments): T | undefined {
-    switch (request.method as Method) {
-      case 'wallet_switchEthereumChain': {
-        const params = request.params as SwitchEthereumChainParam;
-        if (!params || !params[0]?.chainId) {
-          throw standardErrors.rpc.invalidParams();
-        }
-        const chainId = ensureIntNumber(params[0].chainId);
-        const switched = this.stateManager.switchChain(chainId);
-        // "return null if the request was successful"
-        // https://eips.ethereum.org/EIPS/eip-3326#wallet_switchethereumchain
-        return switched ? (null as T) : undefined;
-      }
-      case 'wallet_getCapabilities': {
-        const walletCapabilities = this.stateManager.walletCapabilities;
-        if (!walletCapabilities) {
-          // This should never be the case for scw connections as capabilities are set during handshake
-          throw standardErrors.provider.unauthorized(
-            'No wallet capabilities found, please disconnect and reconnect'
-          );
-        }
-        return walletCapabilities as T;
-      }
-      default:
-        return undefined;
+  /**
+   * @returns `null` if the request was successful.
+   * https://eips.ethereum.org/EIPS/eip-3326#wallet_switchethereumchain
+   */
+  private async handleSwitchChainRequest(request: RequestArguments) {
+    const params = request.params as [
+      {
+        chainId: `0x${string}`;
+      },
+    ];
+    if (!params || !params[0]?.chainId) {
+      throw standardErrors.rpc.invalidParams();
     }
+    const chainId = ensureIntNumber(params[0].chainId);
+
+    const localResult = this.updateChain(chainId);
+    if (localResult) return null;
+
+    const popupResult = await this.sendRequestToPopup(request);
+    if (popupResult === null) {
+      this.updateChain(chainId);
+    }
+    return popupResult;
   }
 
   private async sendEncryptedRequest(request: RequestArguments): Promise<RPCResponseMessage> {
@@ -129,13 +203,13 @@ export class SCWSigner implements Signer {
     const encrypted = await encryptContent(
       {
         action: request,
-        chainId: this.stateManager.activeChain.id,
+        chainId: this.chain.id,
       },
       sharedSecret
     );
     const message = await this.createRequestMessage({ encrypted });
 
-    return this.postMessageToPopup(message);
+    return this.communicator.postRequestAndWaitForResponse(message);
   }
 
   private async createRequestMessage(
@@ -150,7 +224,7 @@ export class SCWSigner implements Signer {
     };
   }
 
-  private async decryptResponseMessage<T>(message: RPCResponseMessage): Promise<RPCResponse<T>> {
+  private async decryptResponseMessage(message: RPCResponseMessage): Promise<RPCResponse> {
     const content = message.content;
 
     // throw protocol level error
@@ -163,41 +237,37 @@ export class SCWSigner implements Signer {
       throw standardErrors.provider.unauthorized('Invalid session');
     }
 
-    return decryptContent(content.encrypted, sharedSecret);
-  }
+    const response: RPCResponse = await decryptContent(content.encrypted, sharedSecret);
 
-  private updateInternalState<T>(request: RequestArguments, response: RPCResponse<T>) {
     const availableChains = response.data?.chains;
     if (availableChains) {
-      this.stateManager.updateAvailableChains(availableChains);
+      const chains = Object.entries(availableChains).map(([id, rpcUrl]) => ({
+        id: Number(id),
+        rpcUrl,
+      }));
+      this.storage.storeObject(AVAILABLE_CHAINS_STORAGE_KEY, chains);
+      this.updateChain(this.chain.id, chains);
     }
 
     const walletCapabilities = response.data?.capabilities;
     if (walletCapabilities) {
-      this.stateManager.updateWalletCapabilities(walletCapabilities);
+      this.storage.storeObject(WALLET_CAPABILITIES_STORAGE_KEY, walletCapabilities);
     }
 
-    const result = response.result;
-    if ('error' in result) return;
+    return response;
+  }
 
-    switch (request.method as Method) {
-      case 'eth_requestAccounts': {
-        const accounts = result.value as AddressString[];
-        this.stateManager.updateAccounts(accounts);
-        break;
-      }
-      case 'wallet_switchEthereumChain': {
-        // "return null if the request was successful"
-        // https://eips.ethereum.org/EIPS/eip-3326#wallet_switchethereumchain
-        if (result.value !== null) return;
+  private updateChain(chainId: number, newAvailableChains?: Chain[]): boolean {
+    const chains =
+      newAvailableChains ?? this.storage.loadObject<Chain[]>(AVAILABLE_CHAINS_STORAGE_KEY);
+    const chain = chains?.find((chain) => chain.id === chainId);
+    if (!chain) return false;
 
-        const params = request.params as SwitchEthereumChainParam;
-        const chainId = ensureIntNumber(params[0].chainId);
-        this.stateManager.switchChain(chainId);
-        break;
-      }
-      default:
-        break;
+    if (chain !== this.chain) {
+      this.chain = chain;
+      this.storage.storeObject(ACTIVE_CHAIN_STORAGE_KEY, chain);
+      this.callback?.('chainChanged', hexStringFromNumber(chain.id));
     }
+    return true;
   }
 }

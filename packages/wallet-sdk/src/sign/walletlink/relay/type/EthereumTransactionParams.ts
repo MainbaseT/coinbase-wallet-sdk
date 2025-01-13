@@ -1,4 +1,4 @@
-import { AddressString, IntNumber } from ':core/type';
+import { AddressString, IntNumber } from ':core/type/index.js';
 
 export interface EthereumTransactionParams {
   fromAddress: AddressString;
@@ -10,5 +10,5 @@ export interface EthereumTransactionParams {
   maxFeePerGas: bigint | null; // in wei
   maxPriorityFeePerGas: bigint | null; // in wei
   gasLimit: bigint | null;
-  chainId: IntNumber;
+  chainId: number;
 }
