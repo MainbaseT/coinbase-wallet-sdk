@@ -1,8 +1,6 @@
 # Coinbase Wallet SDK
 
 [![npm](https://img.shields.io/npm/v/@coinbase/wallet-sdk.svg)](https://www.npmjs.com/package/@coinbase/wallet-sdk)
-[![npm](https://img.shields.io/npm/v/@coinbase/wallet-sdk/rc.svg)](https://www.npmjs.com/package/@coinbase/wallet-sdk/v/rc)
-[![npm](https://img.shields.io/npm/v/@coinbase/wallet-sdk/beta.svg)](https://www.npmjs.com/package/@coinbase/wallet-sdk/v/beta)
 
 ## Coinbase Wallet SDK allows dapps to connect to Coinbase Wallet
 
@@ -12,7 +10,7 @@
    - Desktop: Users can connect to your dapp by scanning a QR code
    - Mobile: Users can connect to your mobile dapp through a deeplink to the dapp browser
 1. Coinbase Wallet extension for [Chrome](https://chrome.google.com/webstore/detail/coinbase-wallet-extension/hnfanknocfeofbddgcijnmhnfnkdnaad?hl=en) and [Brave](https://chromewebstore.google.com/detail/coinbase-wallet-extension/hnfanknocfeofbddgcijnmhnfnkdnaad?hl=en)
-   - Desktop: Users can connect by clicking the connect with extension option.
+   - Desktop: Users can connect by clicking the connect with an extension option.
 
 ### Installing Wallet SDK
 
@@ -48,9 +46,9 @@
 
 ### Upgrading Wallet SDK
 
-> Migrating from v3 to v4? Please see our [v4 migration guide](docs/migration_guide.md) for a full list of breaking changes.
+> Migrating from v3 to v4? Please see our [v4 migration guide](https://www.smartwallet.dev/sdk/v3-to-v4-changes) for a full list of breaking changes.
 
-1. Compare installed version with latest:
+1. Compare the installed version with the latest:
 
    ```shell
    # yarn
@@ -86,7 +84,7 @@
    const provider = sdk.makeWeb3Provider();
    ```
 
-3. Request accounts to initialize connection to wallet
+3. Request accounts to initialize a connection to wallet
 
    ```js
    const addresses = provider.request({
@@ -102,8 +100,6 @@
      addresses[0],
    ]);
    ```
-
-   [See more example methods in apps/testapp/src/components/RpcMethods/method](apps/testapp/src/components/RpcMethods/method)
 
 5. Handle provider events
 
@@ -136,11 +132,4 @@
 
   1. Fork this repo and clone it
   1. From the root dir run `yarn install`
-  1. `cd apps/testapp && yarn install` to install testapp dependencies
   1. From the root dir run `yarn dev`
-
-     - starts two dev servers in parallel:
-       - `@coinbase/wallet-sdk-testapp`
-       - `@coinbase/wallet-sdk`
-
-  1. Visit localhost:3001 in your browser to view the testapp
