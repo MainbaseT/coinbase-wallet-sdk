@@ -1,9 +1,9 @@
-import { SerializedEthereumRpcError } from ':core/error';
+import { SerializedEthereumRpcError } from '../error/utils.js';
 
-export type RPCResponse<T> = {
+export type RPCResponse = {
   result:
     | {
-        value: T; // JSON-RPC result
+        value: unknown; // JSON-RPC result
       }
     | {
         error: SerializedEthereumRpcError;
